@@ -17,7 +17,7 @@ class YouTubeChannelVideos(BaseWidget):
         time_filter: int = Field(24, description="只返回多少小时内上传的视频 (0表示不过滤)", ge=0)
     
     class OutputsSchema(BaseWidget.OutputsSchema):
-        videos: List[Dict[str, Any]] = Field([], description="符合条件的视频列表")
+        videos: List = Field([], description="符合条件的视频列表")
         filtered_count: int = Field(0, description="时间过滤后的视频数量")
         total_fetched: int = Field(0, description="获取的视频总数")
     
