@@ -29,13 +29,13 @@ class YouTubeChannelVideos(BaseWidget):
         max_videos_per_channel: int = Field(1, description="每个频道要获取的最新视频数量 (1-10)", ge=1, le=10)
         time_filter: int = Field(24, description="只返回多少小时内上传的视频 (0表示不过滤)", ge=0)
         # Download options
-        download_videos: bool = Field(False, description="是否获取视频下载链接")
+        download_videos: bool = Field(True, description="是否获取视频下载链接")
         download_resolution: str = Field("360", description="视频分辨率 (720, 480, 360, etc.)")
-        use_residential_proxy: bool = Field(False, description="下载时是否使用住宅代理")
+        use_residential_proxy: bool = Field(True, description="下载时是否使用住宅代理")
         proxy_country: str = Field("US", description="下载时代理服务器国家/地区代码")
         force_refresh_cache: bool = Field(False, description="强制刷新下载链接缓存")
         # Transcription options
-        transcribe_videos: bool = Field(False, description="是否对下载的视频进行转录")
+        transcribe_videos: bool = Field(True, description="是否对下载的视频进行转录")
         # min_speakers: int = Field(-1, description="转录时最小说话人数 (-1 表示自动)") # TODO: Add later if needed
         # max_speakers: int = Field(-1, description="转录时最大说话人数 (-1 表示自动)") # TODO: Add later if needed
 
@@ -50,7 +50,10 @@ class YouTubeChannelVideos(BaseWidget):
         videos: List[dict] = Field([], description="符合条件的视频列表, 可能包含下载信息")
         filtered_count: int = Field(0, description="时间过滤后的视频数量")
         total_fetched: int = Field(0, description="获取的视频总数")
-        error: str = Field(None, description="执行过程中发生的错误信息")
+        fresh_downloads_count: int = Field(0, description="新获取的下载链接数量（非缓存）")
+        has_new_videos: bool = Field(False, description="是否有新增视频需要刷新")
+        combined_text: str = Field("", description="所有视频信息的长文本合集，包含标题、上传时间、链接和转录文本")
+        error: str = Field('NA', description="执行过程中发生的错误信息")
 
     # --- Helper methods from YouTubeDownloaderWidget (adapted) ---
 
@@ -88,6 +91,35 @@ class YouTubeChannelVideos(BaseWidget):
             return True
         except Exception as e:
             logging.error(f"保存链接映射失败: {repr(e)}")
+            return False # Indicate failure
+
+    def _get_transcript_from_store(self, client, store_id, youtube_url):
+        """从store中获取缓存的转录结果"""
+        MAP_KEY = "youtube_transcript_map"
+        try:
+            record = client.key_value_store(store_id).get_record(MAP_KEY)
+            transcript_map = record.get("value", {}) if record else {}
+            cached_transcript = transcript_map.get(youtube_url)
+            if cached_transcript:
+                logging.info(f"从缓存获取到转录结果: {youtube_url}")
+            return cached_transcript
+        except Exception as e:
+            # Log non-critical errors, return None to indicate cache miss
+            logging.warning(f"从KV存储获取转录结果失败 (non-critical): {repr(e)}")
+            return None
+
+    def _save_transcript_to_store(self, client, store_id, youtube_url, transcript_data):
+        """保存转录结果到store"""
+        MAP_KEY = "youtube_transcript_map"
+        try:
+            record = client.key_value_store(store_id).get_record(MAP_KEY)
+            transcript_map = record.get("value", {}) if record else {}
+            transcript_map[youtube_url] = transcript_data
+            client.key_value_store(store_id).set_record(MAP_KEY, transcript_map)
+            logging.info(f"成功缓存转录结果: {youtube_url}")
+            return True
+        except Exception as e:
+            logging.error(f"保存转录结果映射失败: {repr(e)}")
             return False # Indicate failure
 
     def _is_url_valid(self, url):
@@ -250,6 +282,7 @@ class YouTubeChannelVideos(BaseWidget):
         if not api_token:
             return {
                 "videos": [], "filtered_count": 0, "total_fetched": 0,
+                "fresh_downloads_count": 0, "has_new_videos": False,
                 "error": "未提供API令牌，请设置环境变量 APIFY_API_KEY"
             }
 
@@ -275,6 +308,7 @@ class YouTubeChannelVideos(BaseWidget):
             except Exception as e:
                  return {
                     "videos": [], "filtered_count": 0, "total_fetched": 0,
+                    "fresh_downloads_count": 0, "has_new_videos": False,
                     "error": f"Failed to initialize download cache: {repr(e)}"
                 }
 
@@ -336,9 +370,12 @@ class YouTubeChannelVideos(BaseWidget):
             traceback.print_exc() # Add traceback for debugging
             return {
                 "videos": [], "filtered_count": 0, "total_fetched": 0,
+                "fresh_downloads_count": 0, "has_new_videos": False,
                 "error": f"Error fetching channel videos: {repr(e)}"
             }
-
+        cache_hit_count = 0
+        fresh_downloads_count = 0  # 新增变量，用于追踪新下载的链接数
+        
         # --- Step 2: Download Videos (if requested) ---
         if download_videos and filtered_videos:
             logging.info(f"Attempting to get download links for {filtered_count} videos (resolution: {download_resolution})")
@@ -369,6 +406,7 @@ class YouTubeChannelVideos(BaseWidget):
                             video["download_message"] = "Successfully retrieved cached download link."
                             video["download_url"] = cached_url
                             video["download_cached"] = True
+                            cache_hit_count += 1  # 增加缓存命中计数
                             continue # Move to next video
                         else:
                             logging.info(f"Cached URL is invalid for {video_url}. Fetching fresh link.")
@@ -392,6 +430,7 @@ class YouTubeChannelVideos(BaseWidget):
 
                     run_download = client.actor(downloader_actor_id).call(run_input=run_input_download)
                     download_results = list(client.dataset(run_download["defaultDatasetId"]).iterate_items())
+                    fresh_downloads_count += 1  # 增加新下载链接计数
 
                     if download_results and "downloadUrl" in download_results[0] and download_results[0]["downloadUrl"]:
                         download_url = download_results[0]["downloadUrl"]
@@ -405,20 +444,40 @@ class YouTubeChannelVideos(BaseWidget):
                         # --- >>> START TRANSCRIPTION BLOCK <<< ---
                         if transcribe_videos and whisperx_base_url:
                             logging.info(f"Starting transcription for: {video_url}")
-                            transcription_status, transcription_result = self._get_transcription(download_url, whisperx_base_url)
-                            video["transcription_status"] = transcription_status
-                            if transcription_status == "success":
-                                video["transcript"] = transcription_result
-                                video["transcription_message"] = "Transcription successful."
-                                logging.info(f"Transcription successful for {video_url}")
+                            
+                            # 检查是否有缓存的转录结果 (仅当不强制刷新缓存时)
+                            cached_transcript = None
+                            if not force_refresh_cache:
+                                cached_transcript = self._get_transcript_from_store(client, store_id, video_url)
+                            
+                            if cached_transcript and not force_refresh_cache:
+                                # 使用缓存的转录结果
+                                video["transcription_status"] = "success"
+                                video["transcript"] = cached_transcript
+                                video["transcription_message"] = "Transcription retrieved from cache."
+                                video["transcription_cached"] = True
+                                logging.info(f"使用缓存的转录结果: {video_url}")
                             else:
-                                video["transcript"] = None
-                                video["transcription_message"] = transcription_result # Contains the error message
-                                logging.error(f"Transcription failed for {video_url}: {transcription_result}")
+                                # 重新进行转录
+                                video["transcription_cached"] = False
+                                logging.info(f"Starting transcription for cached video: {video.get('url')}")
+                                transcription_status, transcription_result = self._get_transcription(download_url, whisperx_base_url)
+                                video["transcription_status"] = transcription_status
+                                if transcription_status == "success":
+                                    video["transcript"] = transcription_result
+                                    video["transcription_message"] = "Transcription successful."
+                                    logging.info(f"Transcription successful for {video_url}")
+                                    # 保存转录结果到缓存
+                                    self._save_transcript_to_store(client, store_id, video_url, transcription_result)
+                                else:
+                                    video["transcript"] = None
+                                    video["transcription_message"] = transcription_result # Contains the error message
+                                    logging.error(f"Transcription failed for {video_url}: {transcription_result}")
                         else:
                             # Ensure keys exist even if transcription is skipped or failed before starting
                             video["transcription_status"] = "skipped"
                             video["transcript"] = None
+                            video["transcription_cached"] = False
                             if not transcribe_videos:
                                 video["transcription_message"] = "Transcription was not requested."
                             elif not whisperx_base_url:
@@ -453,24 +512,40 @@ class YouTubeChannelVideos(BaseWidget):
             for video in filtered_videos:
                 if video.get("download_status") == "success" and video.get("download_cached") == True:
                     if transcribe_videos and whisperx_base_url and video.get("download_url"):
-                         # Check if transcription was already done (e.g., in a previous run for this cached URL)
-                         # This basic implementation will re-transcribe cached videos if requested.
-                         # A more advanced cache could store transcription results too.
-                        logging.info(f"Starting transcription for cached video: {video.get('url')}")
-                        transcription_status, transcription_result = self._get_transcription(video["download_url"], whisperx_base_url)
-                        video["transcription_status"] = transcription_status
-                        if transcription_status == "success":
-                            video["transcript"] = transcription_result
-                            video["transcription_message"] = "Transcription successful (for cached video)."
-                            logging.info(f"Transcription successful for cached {video.get('url')}")
-                        else:
-                            video["transcript"] = None
-                            video["transcription_message"] = transcription_result # Contains the error message
-                            logging.error(f"Transcription failed for cached {video.get('url')}: {transcription_result}")
+                         # 检查是否有缓存的转录结果 (仅当不强制刷新缓存时)
+                         cached_transcript = None
+                         video_url = video.get("url")
+                         if not force_refresh_cache:
+                             cached_transcript = self._get_transcript_from_store(client, store_id, video_url)
+                         
+                         if cached_transcript and not force_refresh_cache:
+                             # 使用缓存的转录结果
+                             video["transcription_status"] = "success"
+                             video["transcript"] = cached_transcript
+                             video["transcription_message"] = "Transcription retrieved from cache (for cached video)."
+                             video["transcription_cached"] = True
+                             logging.info(f"使用缓存的转录结果 (缓存视频): {video_url}")
+                         else:
+                             # 重新进行转录
+                             video["transcription_cached"] = False
+                             logging.info(f"Starting transcription for cached video: {video.get('url')}")
+                             transcription_status, transcription_result = self._get_transcription(video["download_url"], whisperx_base_url)
+                             video["transcription_status"] = transcription_status
+                             if transcription_status == "success":
+                                 video["transcript"] = transcription_result
+                                 video["transcription_message"] = "Transcription successful (for cached video)."
+                                 logging.info(f"Transcription successful for cached {video.get('url')}")
+                                 # 保存转录结果到缓存
+                                 self._save_transcript_to_store(client, store_id, video_url, transcription_result)
+                             else:
+                                 video["transcript"] = None
+                                 video["transcription_message"] = transcription_result # Contains the error message
+                                 logging.error(f"Transcription failed for cached {video.get('url')}: {transcription_result}")
 
                     elif "transcription_status" not in video: # Ensure keys exist if transcription wasn't run
                         video["transcription_status"] = "skipped"
                         video["transcript"] = None
+                        video["transcription_cached"] = False
                         if not transcribe_videos:
                              video["transcription_message"] = "Transcription was not requested."
                         elif not whisperx_base_url:
@@ -479,11 +554,55 @@ class YouTubeChannelVideos(BaseWidget):
                              video["transcription_message"] = "Transcription skipped (cached video)."
 
         # --- Step 3: Return Results ---
+        has_new_videos = fresh_downloads_count > 0  # 如果有新下载的链接，则认为有新视频
+        
+        # 构建combined_text
+        combined_text = ""
+        for video in filtered_videos:
+            title = video.get('title', 'N/A')
+            upload_time = video.get('date', 'N/A')
+            link = video.get('url', 'N/A')
+            # 获取频道名称，Apify返回的数据中可能用不同的字段表示
+            channel_name = video.get('authorName', video.get('channelName', video.get('author', 'N/A')))
+            
+            # 获取转录文本
+            transcript_text = "没有转录文本"
+            if video.get('transcription_status') == "success" and video.get('transcript'):
+                # 处理转录文本，可能需要根据实际转录结果的结构进行调整
+                transcript_data = video.get('transcript')
+                if isinstance(transcript_data, dict) and 'text' in transcript_data:
+                    transcript_text = transcript_data['text']
+                elif isinstance(transcript_data, dict) and 'segments' in transcript_data:
+                    # 如果转录结果是分段的，尝试从segments中提取文本
+                    segments = transcript_data.get('segments', [])
+                    segments_text = [seg.get('text', '') for seg in segments if 'text' in seg]
+                    transcript_text = ' '.join(segments_text)
+                elif isinstance(transcript_data, str):
+                    transcript_text = transcript_data
+                else:
+                    # 尝试将任何对象转换为字符串
+                    transcript_text = str(transcript_data)
+            
+            # 构建这个视频的文本块
+            video_text = f"""
+频道: {channel_name}
+标题: {title}
+上传时间: {upload_time}
+链接: {link}
+转录内容: 
+{transcript_text}
+------------------------------------------------
+"""
+            combined_text += video_text
+        
         return {
             "videos": filtered_videos,
             "filtered_count": filtered_count,
             "total_fetched": total_fetched,
-            "error": None # Indicate overall success if we reached here
+            "fresh_downloads_count": fresh_downloads_count,
+            "has_new_videos": has_new_videos,
+            "combined_text": combined_text,
+            "error": 'NA' # Indicate overall success if we reached here
         }
 
 
@@ -549,6 +668,8 @@ if __name__ == "__main__":
                 print("\n--- Video Details ---")
                 for i, video in enumerate(result['videos']):
                     print(f"\nVideo #{i+1}:")
+                    channel_name = video.get('authorName', video.get('channelName', video.get('author', 'N/A')))
+                    print(f"  Channel: {channel_name}")
                     print(f"  Title: {video.get('title', 'N/A')}")
                     print(f"  URL: {video.get('url', 'N/A')}")
                     print(f"  Uploaded: {video.get('date', 'N/A')}")
@@ -563,6 +684,7 @@ if __name__ == "__main__":
                     if 'transcription_status' in video:
                         print(f"  Transcription Status: {video['transcription_status']}")
                         print(f"  Transcription Message: {video['transcription_message']}")
+                        print(f"  Transcription Cached: {video.get('transcription_cached', 'N/A')}")
                         # Optionally print only a snippet of the transcript if it's long
                         transcript_preview = str(video.get('transcript', 'N/A'))
                         if len(transcript_preview) > 100:
@@ -570,6 +692,18 @@ if __name__ == "__main__":
                         print(f"  Transcript: {transcript_preview}")
             else:
                 print("\nNo videos found matching the criteria.")
+            
+            # 显示combined_text的预览
+            if 'combined_text' in result and result['combined_text']:
+                print("\n--- Combined Text Preview ---")
+                text_preview = result['combined_text']
+                # 如果文本过长，只显示前500个字符和后100个字符
+                if len(text_preview) > 600:
+                    preview = text_preview[:500] + "\n...\n" + text_preview[-100:]
+                    print(preview)
+                    print(f"\n[Total combined text length: {len(text_preview)} characters]")
+                else:
+                    print(text_preview)
 
     except Exception as e:
         import traceback
