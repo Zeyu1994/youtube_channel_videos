@@ -1,5 +1,6 @@
 import os
 import re
+import json  # 添加json导入
 import logging
 import requests
 import time # Add time import for polling
@@ -25,7 +26,7 @@ class YouTubeChannelVideos(BaseWidget):
     NAME = "YouTube Channel Videos & Downloader"
 
     class InputsSchema(BaseWidget.InputsSchema):
-        channel_urls: List[str] = Field(["https://www.youtube.com/@yttalkjun"], description="YouTube频道URL列表, 例如: [\"https://www.youtube.com/@channelname1\", \"https://www.youtube.com/@channelname2\"]")
+        channel_urls: str = Field('["https://www.youtube.com/@yttalkjun"]', description="YouTube频道URL列表, JSON格式字符串，例如: '[\"https://www.youtube.com/@channelname1\", \"https://www.youtube.com/@channelname2\"]'")
         max_videos_per_channel: int = Field(1, description="每个频道要获取的最新视频数量 (1-10)", ge=1, le=10)
         time_filter: int = Field(24, description="只返回多少小时内上传的视频 (0表示不过滤)", ge=0)
         # Download options
@@ -268,7 +269,16 @@ class YouTubeChannelVideos(BaseWidget):
     # --- Main Execution Logic ---
 
     def execute(self, environ, config):
-        channel_urls = config.channel_urls
+        try:
+            channel_urls = json.loads(config.channel_urls)
+        except json.JSONDecodeError:
+            return {
+                "videos": [], "filtered_count": 0, "total_fetched": 0,
+                "fresh_downloads_count": 0, "has_new_videos": False,
+                "combined_text": "",
+                "error": "无效的channel_urls JSON格式"
+            }
+            
         max_videos_per_channel = config.max_videos_per_channel
         time_filter = config.time_filter
         download_videos = config.download_videos
@@ -624,10 +634,7 @@ if __name__ == "__main__":
 
         # --- Test Case Configuration ---
         test_config = EasyDict({
-            "channel_urls": [
-                "https://www.youtube.com/@yttalkjun",
-                "https://www.youtube.com/@shanghaojin" # Add another channel
-            ],
+            "channel_urls": '["https://www.youtube.com/@yttalkjun"]',
             "max_videos_per_channel": 1, # Get latest 1 video per channel
             "time_filter": 0,
             "download_videos": True,  # Ensure downloading is enabled for transcription
